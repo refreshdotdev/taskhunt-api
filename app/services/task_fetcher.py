@@ -1,15 +1,14 @@
-"""Fetch tasks from GitHub repositories."""
+"""Fetch tasks from GitHub repositories with ETag-based caching."""
 
 import asyncio
 import base64
 import logging
-from functools import lru_cache
-from time import time
 
 import httpx
 
 from app.config import BENCHMARKS, BenchmarkConfig, settings
 from app.models.task import Task
+from app.services.cache import get_cache
 from app.services.task_parser import TaskParser
 
 logger = logging.getLogger(__name__)
@@ -20,49 +19,102 @@ class TaskFetcher:
 
     def __init__(self):
         self.parser = TaskParser()
-        self._cache: dict[str, tuple[float, list[Task]]] = {}
+        self.cache = get_cache()
         self._cache_ttl = settings.cache_ttl_seconds
 
-    def _get_headers(self) -> dict[str, str]:
+    def _get_headers(self, etag: str | None = None) -> dict[str, str]:
         """Get headers for GitHub API requests."""
         headers = {"Accept": "application/vnd.github.v3+json"}
         if settings.github_token:
             headers["Authorization"] = f"token {settings.github_token}"
+        if etag:
+            headers["If-None-Match"] = etag
         return headers
 
     async def _fetch_directory_contents(
-        self, client: httpx.AsyncClient, owner: str, repo: str, path: str, branch: str
+        self,
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+        path: str,
+        branch: str,
     ) -> list[dict]:
-        """Fetch contents of a directory from GitHub."""
+        """Fetch contents of a directory from GitHub with ETag caching."""
+        cache_key = f"dir:{owner}/{repo}/{path}@{branch}"
+        cached_entry = self.cache.get(cache_key)
+        etag = cached_entry.etag if cached_entry else None
+
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
         params = {"ref": branch}
 
-        response = await client.get(url, params=params, headers=self._get_headers())
+        response = await client.get(
+            url, params=params, headers=self._get_headers(etag)
+        )
+
+        if response.status_code == 304:
+            # Not modified - use cached data
+            self.cache.touch(cache_key)
+            logger.info(f"Cache hit (304): {cache_key}")
+            return cached_entry.data if cached_entry else []
+
         if response.status_code == 404:
             return []
+
         response.raise_for_status()
-        return response.json()
+
+        # Cache the response with ETag
+        data = response.json()
+        new_etag = response.headers.get("ETag")
+        self.cache.set(cache_key, data, new_etag)
+        logger.info(f"Cache updated: {cache_key}")
+
+        return data
 
     async def _fetch_file_content(
-        self, client: httpx.AsyncClient, owner: str, repo: str, path: str, branch: str
+        self,
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+        path: str,
+        branch: str,
     ) -> str | None:
-        """Fetch content of a file from GitHub."""
+        """Fetch content of a file from GitHub with ETag caching."""
+        cache_key = f"file:{owner}/{repo}/{path}@{branch}"
+        cached_entry = self.cache.get(cache_key)
+        etag = cached_entry.etag if cached_entry else None
+
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
         params = {"ref": branch}
 
-        response = await client.get(url, params=params, headers=self._get_headers())
+        response = await client.get(
+            url, params=params, headers=self._get_headers(etag)
+        )
+
+        if response.status_code == 304:
+            # Not modified - use cached data
+            self.cache.touch(cache_key)
+            return cached_entry.data if cached_entry else None
+
         if response.status_code == 404:
             return None
+
         response.raise_for_status()
 
         data = response.json()
+        content = None
         if data.get("encoding") == "base64":
-            return base64.b64decode(data["content"]).decode("utf-8")
-        return data.get("content")
+            content = base64.b64decode(data["content"]).decode("utf-8")
+        else:
+            content = data.get("content")
+
+        # Cache the decoded content with ETag
+        new_etag = response.headers.get("ETag")
+        self.cache.set(cache_key, content, new_etag)
+
+        return content
 
     def _parse_github_url(self, url: str) -> tuple[str, str]:
         """Parse owner and repo from GitHub URL."""
-        # Handle URLs like https://github.com/owner/repo
         parts = url.rstrip("/").split("/")
         return parts[-2], parts[-1]
 
@@ -101,7 +153,9 @@ class TaskFetcher:
                             client, owner, repo, yaml_path, benchmark.branch
                         )
                         if content:
-                            github_url = f"{benchmark.github_url}/tree/{benchmark.branch}/{task_path}"
+                            github_url = (
+                                f"{benchmark.github_url}/tree/{benchmark.branch}/{task_path}"
+                            )
                             return self.parser.parse_yaml(
                                 task_id=task_id,
                                 content=content,
@@ -124,7 +178,9 @@ class TaskFetcher:
                         )
 
                         if toml_content:
-                            github_url = f"{benchmark.github_url}/tree/{benchmark.branch}/{task_path}"
+                            github_url = (
+                                f"{benchmark.github_url}/tree/{benchmark.branch}/{task_path}"
+                            )
                             return self.parser.parse_toml(
                                 task_id=task_id,
                                 toml_content=toml_content,
@@ -147,11 +203,12 @@ class TaskFetcher:
         """Fetch tasks from all benchmarks."""
         cache_key = "all_tasks"
 
-        # Check cache
-        if use_cache and cache_key in self._cache:
-            cached_time, cached_tasks = self._cache[cache_key]
-            if time() - cached_time < self._cache_ttl:
-                return cached_tasks
+        # Check if we have fresh cached tasks
+        if use_cache:
+            cached_entry = self.cache.get(cache_key)
+            if cached_entry and self.cache.is_fresh(cache_key, self._cache_ttl):
+                logger.info("Returning cached tasks (TTL fresh)")
+                return cached_entry.data
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Fetch from all benchmarks in parallel
@@ -168,7 +225,7 @@ class TaskFetcher:
                     all_tasks.extend(result)
 
         # Update cache
-        self._cache[cache_key] = (time(), all_tasks)
+        self.cache.set(cache_key, all_tasks)
 
         return all_tasks
 

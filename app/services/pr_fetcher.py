@@ -1,14 +1,14 @@
-"""Fetch tasks from open pull requests."""
+"""Fetch tasks from open pull requests with ETag-based caching."""
 
 import asyncio
 import base64
 import logging
-from time import time
 
 import httpx
 
 from app.config import BENCHMARKS, BenchmarkConfig, settings
 from app.models.task import PRInfo, Task
+from app.services.cache import get_cache
 from app.services.task_parser import TaskParser
 
 logger = logging.getLogger(__name__)
@@ -19,14 +19,16 @@ class PRFetcher:
 
     def __init__(self):
         self.parser = TaskParser()
-        self._cache: dict[str, tuple[float, list[Task]]] = {}
+        self.cache = get_cache()
         self._cache_ttl = settings.cache_ttl_seconds
 
-    def _get_headers(self) -> dict[str, str]:
+    def _get_headers(self, etag: str | None = None) -> dict[str, str]:
         """Get headers for GitHub API requests."""
         headers = {"Accept": "application/vnd.github.v3+json"}
         if settings.github_token:
             headers["Authorization"] = f"token {settings.github_token}"
+        if etag:
+            headers["If-None-Match"] = etag
         return headers
 
     def _parse_github_url(self, url: str) -> tuple[str, str]:
@@ -37,44 +39,95 @@ class PRFetcher:
     async def _fetch_open_prs(
         self, client: httpx.AsyncClient, owner: str, repo: str
     ) -> list[dict]:
-        """Fetch open pull requests from a repository."""
+        """Fetch open pull requests from a repository with ETag caching."""
+        cache_key = f"prs:{owner}/{repo}"
+        cached_entry = self.cache.get(cache_key)
+        etag = cached_entry.etag if cached_entry else None
+
         url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
         params = {"state": "open", "per_page": 50}
 
-        response = await client.get(url, params=params, headers=self._get_headers())
+        response = await client.get(url, params=params, headers=self._get_headers(etag))
+
+        if response.status_code == 304:
+            # Not modified - use cached data
+            self.cache.touch(cache_key)
+            logger.info(f"Cache hit (304): {cache_key}")
+            return cached_entry.data if cached_entry else []
+
         if response.status_code == 404:
             return []
+
         response.raise_for_status()
-        return response.json()
+
+        # Cache the response with ETag
+        data = response.json()
+        new_etag = response.headers.get("ETag")
+        self.cache.set(cache_key, data, new_etag)
+        logger.info(f"Cache updated: {cache_key}")
+
+        return data
 
     async def _fetch_pr_files(
         self, client: httpx.AsyncClient, owner: str, repo: str, pr_number: int
     ) -> list[dict]:
-        """Fetch files changed in a PR."""
+        """Fetch files changed in a PR with ETag caching."""
+        cache_key = f"pr_files:{owner}/{repo}/{pr_number}"
+        cached_entry = self.cache.get(cache_key)
+        etag = cached_entry.etag if cached_entry else None
+
         url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
 
-        response = await client.get(url, headers=self._get_headers())
+        response = await client.get(url, headers=self._get_headers(etag))
+
+        if response.status_code == 304:
+            self.cache.touch(cache_key)
+            return cached_entry.data if cached_entry else []
+
         if response.status_code == 404:
             return []
+
         response.raise_for_status()
-        return response.json()
+
+        data = response.json()
+        new_etag = response.headers.get("ETag")
+        self.cache.set(cache_key, data, new_etag)
+
+        return data
 
     async def _fetch_file_content(
         self, client: httpx.AsyncClient, owner: str, repo: str, path: str, ref: str
     ) -> str | None:
-        """Fetch content of a file from a specific ref."""
+        """Fetch content of a file from a specific ref with ETag caching."""
+        cache_key = f"file:{owner}/{repo}/{path}@{ref}"
+        cached_entry = self.cache.get(cache_key)
+        etag = cached_entry.etag if cached_entry else None
+
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
         params = {"ref": ref}
 
-        response = await client.get(url, params=params, headers=self._get_headers())
+        response = await client.get(url, params=params, headers=self._get_headers(etag))
+
+        if response.status_code == 304:
+            self.cache.touch(cache_key)
+            return cached_entry.data if cached_entry else None
+
         if response.status_code == 404:
             return None
+
         response.raise_for_status()
 
         data = response.json()
+        content = None
         if data.get("encoding") == "base64":
-            return base64.b64decode(data["content"]).decode("utf-8")
-        return data.get("content")
+            content = base64.b64decode(data["content"]).decode("utf-8")
+        else:
+            content = data.get("content")
+
+        new_etag = response.headers.get("ETag")
+        self.cache.set(cache_key, content, new_etag)
+
+        return content
 
     def _extract_task_ids_from_files(
         self, files: list[dict], benchmark: BenchmarkConfig
@@ -89,7 +142,7 @@ class PRFetcher:
                 continue
 
             # Remove prefix and get task ID (first path component after prefix)
-            relative_path = filename[len(prefix):]
+            relative_path = filename[len(prefix) :]
             parts = relative_path.split("/")
             if len(parts) >= 1 and parts[0]:
                 task_ids.add(parts[0])
@@ -215,11 +268,12 @@ class PRFetcher:
         """Fetch tasks from all open PRs across all benchmarks."""
         cache_key = "all_pr_tasks"
 
-        # Check cache
-        if use_cache and cache_key in self._cache:
-            cached_time, cached_tasks = self._cache[cache_key]
-            if time() - cached_time < self._cache_ttl:
-                return cached_tasks
+        # Check if we have fresh cached tasks
+        if use_cache:
+            cached_entry = self.cache.get(cache_key)
+            if cached_entry and self.cache.is_fresh(cache_key, self._cache_ttl):
+                logger.info("Returning cached PR tasks (TTL fresh)")
+                return cached_entry.data
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             results = await asyncio.gather(
@@ -235,7 +289,7 @@ class PRFetcher:
                     all_tasks.extend(result)
 
         # Update cache
-        self._cache[cache_key] = (time(), all_tasks)
+        self.cache.set(cache_key, all_tasks)
 
         return all_tasks
 
