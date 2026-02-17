@@ -58,7 +58,8 @@ class Settings:
 
     def __post_init__(self):
         self.github_token = os.getenv("GITHUB_TOKEN")
-        cors_env = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
+        default_origins = "http://localhost:5173,http://localhost:3000,https://taskhunt-ai.vercel.app,https://frontend-amber-three-59.vercel.app"
+        cors_env = os.getenv("CORS_ORIGINS", default_origins)
         self.cors_origins = [origin.strip() for origin in cors_env.split(",")]
 
 
